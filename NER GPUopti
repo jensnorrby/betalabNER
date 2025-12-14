@@ -1,0 +1,228 @@
+# ================================
+# 0. Importer
+# ================================
+from pathlib import Path
+from itertools import chain
+from math import ceil
+from multiprocessing import Process
+import json
+import torch
+from transformers import pipeline
+
+
+# ================================
+# 1. Skapa NER-pipeline (en per GPU/process)
+# ================================
+def create_ner_pipeline(device: int):
+    """
+    Skapar en HuggingFace NER-pipeline på angiven GPU.
+    device: GPU-id (0, 1, 2, ...)
+    """
+    print(f"[GPU {device}] Laddar NER-modell...")
+    nlp = pipeline(
+        "ner",
+        model="dslim/bert-base-NER",  # byt modell här om du vill använda KBLab-modell etc.
+        device=device
+    )
+    print(f"[GPU {device}] Modell laddad.")
+    return nlp
+
+
+# ================================
+# 2. YearWalk – bearbeta EN fil
+# ================================
+class YearWalk:
+    """
+    Läser in en textfil, kör NER i batchar och sparar alla LOC-entities.
+    Tar en redan skapad NER-pipeline för att slippa ladda modellen per fil.
+    """
+    def __init__(self, path: str, nlp, batch_size: int = 64):
+        self.path = path
+        self.title = Path(path).name
+        self.loclist = []
+        self.errors = 0
+        self.nlp = nlp
+        self.batch_size = batch_size
+
+        self._run()
+
+    def _run(self):
+        # Läs text
+        with open(self.path, "r", encoding="utf-8") as f:
+            data = f.read()
+
+        # Enkel tokenisering: dela på mellanslag
+        words = data.split()
+
+        # Kör NER i batchar
+        for i in range(0, len(words), self.batch_size):
+            batch = words[i:i + self.batch_size]
+
+            try:
+                # pipeline med "ner" + lista av strängar → lista av listor av dict
+                results = self.nlp(batch)
+                flat_results = list(chain.from_iterable(results))
+
+                for term in flat_results:
+                    entity = term.get("entity", "")
+                    word = term.get("word", "")
+
+                    # B-LOC → start på en ny plats
+                    if entity.startswith("B-LOC"):
+                        self.loclist.append(word)
+
+                    # I-LOC → fortsättning på föregående plats
+                    elif entity.startswith("I-LOC"):
+                        try:
+                            self.loclist[-1] += " " + word
+                        except IndexError:
+                            # I-LOC utan föregående B-LOC
+                            print(f"[WARN] I-LOC utan B-LOC i fil {self.title}")
+            except RuntimeError as e:
+                # T.ex. CUDA OOM, eller annat
+                self.errors += 1
+                print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
+
+
+# ================================
+# 3. Hjälpfunktioner för multi-GPU
+# ================================
+def chunk_list(lst, n):
+    """
+    Dela upp lst i n ungefär lika stora bitar.
+    Om lst är kortare än n blir vissa chunkar tomma, vilket också är okej.
+    """
+    if n <= 0:
+        return [lst]
+    k = ceil(len(lst) / n) if len(lst) > 0 else 1
+    return [lst[i:i + k] for i in range(0, len(lst), k)]
+
+
+def worker_gpu(gpu_id: int, file_list, year: str, out_dir: str, batch_size: int = 64):
+    """
+    Körs i en separat process per GPU.
+    - Laddar en NER-pipeline på (gpu_id)
+    - Bearbetar alla filer i file_list
+    - Skriver ut en partial-fil: {year}_gpu{gpu_id}.json
+    """
+    if len(file_list) == 0:
+        print(f"[GPU {gpu_id}] Inga filer tilldelade, hoppar över.")
+        return
+
+    print(f"[GPU {gpu_id}] Startar worker med {len(file_list)} filer för år {year}")
+    nlp = create_ner_pipeline(device=gpu_id)
+
+    all_locs = []
+    total_errors = 0
+
+    for fpath in file_list:
+        yw = YearWalk(fpath, nlp=nlp, batch_size=batch_size)
+        all_locs.extend(yw.loclist)
+        total_errors += yw.errors
+        print(f"[GPU {gpu_id}] Klar med {Path(fpath).name}, errors={yw.errors}, locations={len(yw.loclist)}")
+
+    out_dir = Path(out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = out_dir / f"{year}_gpu{gpu_id}.json"
+    with out_file.open("w", encoding="utf-8") as f:
+        json.dump(
+            {"year": year, "gpu": gpu_id, "locs": all_locs, "errors": total_errors},
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    print(f"[GPU {gpu_id}] Klart! Skrev {out_file} (total locations: {len(all_locs)}, errors: {total_errors})")
+
+
+def merge_outputs(year: str, out_dir: str = "~/ner_outputs", final_suffix: str = ""):
+    """
+    Slår ihop alla {year}_gpu*.json från out_dir till en enda fil {year}{final_suffix}.json.
+    """
+    out_dir = Path(out_dir).expanduser()
+    locs = []
+    total_errors = 0
+
+    json_files = sorted(out_dir.glob(f"{year}_gpu*.json"))
+    if not json_files:
+        print(f"Inga partial-filer hittades för år {year} i {out_dir}")
+        return
+
+    for file in json_files:
+        with file.open(encoding="utf-8") as f:
+            data = json.load(f)
+        locs.extend(data.get("locs", []))
+        total_errors += data.get("errors", 0)
+
+    final_name = f"{year}{final_suffix}.json" if final_suffix else f"{year}.json"
+    final_path = out_dir / final_name
+    with final_path.open("w", encoding="utf-8") as f:
+        json.dump({"year": year, "locs": locs, "errors": total_errors}, f, ensure_ascii=False, indent=2)
+
+    print(f"Slutresultat i {final_path}")
+    print(f"Totalt locations: {len(locs)}, total errors: {total_errors}")
+
+
+# ================================
+# 4. Huvudflöde (multi-GPU körning)
+# ================================
+if __name__ == "__main__":
+    # ----------------------------
+    # Konfiguration
+    # ----------------------------
+    # Bas-katalog för ett år, t.ex. ~/Words/1866
+    base_path = "~/Words/1866"   # ändra till din katalog
+    out_dir = "~/ner_outputs"    # var NER-resultaten ska sparas
+    batch_size = 64              # kan ökas om du har gott om GPU-minne
+
+    # ----------------------------
+    # Förbered
+    # ----------------------------
+    base_path = Path(base_path).expanduser()
+    year = base_path.name  # "1866"
+
+    # Hämta alla filer i katalogen
+    files = [str(f) for f in base_path.iterdir() if f.is_file()]
+    files = sorted(files)
+
+    if not files:
+        raise RuntimeError(f"Inga filer hittades i {base_path}")
+
+    # Hur många GPUs har vi?
+    available_gpus = torch.cuda.device_count()
+    if available_gpus == 0:
+        raise RuntimeError("Inga GPUs hittades. Kontrollera CUDA-installation & drivrutiner.")
+
+    # Om du vill begränsa antal GPUs (t.ex. max 8):
+    max_gpus = 8
+    num_gpus = min(available_gpus, max_gpus)
+
+    print(f"Hittade {len(files)} filer för år {year}")
+    print(f"Använder {num_gpus} GPU(s) av {available_gpus} tillgängliga.")
+
+    # Dela upp filerna i num_gpus chunkar
+    file_chunks = chunk_list(files, num_gpus)
+
+    # ----------------------------
+    # Starta en process per GPU
+    # ----------------------------
+    procs = []
+    for gpu_id, chunk in enumerate(file_chunks[:num_gpus]):
+        p = Process(
+            target=worker_gpu,
+            args=(gpu_id, chunk, year, out_dir, batch_size)
+        )
+        p.start()
+        procs.append(p)
+
+    # Vänta tills alla processer är klara
+    for p in procs:
+        p.join()
+
+    print("Alla worker-processer är klara.")
+
+    # ----------------------------
+    # Slå ihop partial-filer
+    # ----------------------------
+    merge_outputs(year=year, out_dir=out_dir)
