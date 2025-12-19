@@ -13,20 +13,24 @@ from transformers import pipeline
 # ================================
 # 1. Skapa NER-pipeline (en per GPU/process)
 # ================================
-def create_ner_pipeline(device: int):
-    """
-    Skapar en HuggingFace NER-pipeline på angiven GPU.
-    device: GPU-id (0, 1, 2, ...)
-    """
-    print(f"[GPU {device}] Laddar NER-modell...")
-    nlp = pipeline(
-        "ner",
-        model="dslim/bert-base-NER",  # byt modell här om du vill använda KBLab-modell etc.
-        device=device
-    )
-    print(f"[GPU {device}] Modell laddad.")
-    return nlp
+from transformers import AutoTokenizer, AutoModelForTokenClassification
 
+def create_ner_pipeline(device: int, model_name: str = "dslim/bert-base-NER", fp16: bool = True):
+    """
+    Skapar model+tokenizer för token-classification på angiven GPU.
+    Vi kör inferens manuellt (snabbare än pipeline när du chunkar/batchar).
+    """
+    print(f"[GPU {device}] Laddar tokenizer+modell ({model_name}) ...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    torch_dtype = torch.float16 if (fp16 and torch.cuda.is_available()) else None
+
+    model = AutoModelForTokenClassification.from_pretrained(model_name, torch_dtype=torch_dtype)
+    model.to(f"cuda:{device}")
+    model.eval()
+
+    print(f"[GPU {device}] Modell laddad. fp16={bool(torch_dtype)}")
+    return {"tokenizer": tokenizer, "model": model, "device": device, "fp16": fp16}
 
 # ================================
 # 2. YearWalk – bearbeta EN fil
@@ -47,42 +51,116 @@ class YearWalk:
         self._run()
 
     def _run(self):
-        # Läs text
-        with open(self.path, "r", encoding="utf-8") as f:
-            data = f.read()
+    # --- Läs text ---
+    with open(self.path, "r", encoding="utf-8") as f:
+        text = f.read()
 
-        # Enkel tokenisering: dela på mellanslag
-        words = data.split()
+    # self.nlp är nu en dict från create_ner_pipeline(...)
+    tokenizer = self.nlp["tokenizer"]
+    model = self.nlp["model"]
+    device = self.nlp["device"]
+    use_fp16 = bool(self.nlp.get("fp16", True))
 
-        # Kör NER i batchar
-        for i in range(0, len(words), self.batch_size):
-            batch = words[i:i + self.batch_size]
+    # --- Tuning-parametrar (VIKTIGA för speed) ---
+    # Öka max_length om du har VRAM (A40 klarar oftast 512 lättare än T4).
+    max_length = 512   # 384, prova 512 på A40/V100 om det ryms
+    stride = 64        # overlap så entities över gränser fångas
+    batch_size = getattr(self, "batch_size", 8)  # per GPU-process
 
-            try:
-                # pipeline med "ner" + lista av strängar → lista av listor av dict
-                results = self.nlp(batch)
-                flat_results = list(chain.from_iterable(results))
+    # Tokenisera med overflow-chunkar + offset mapping
+    enc = tokenizer(
+        text,
+        return_offsets_mapping=True,
+        return_overflowing_tokens=True,
+        truncation=True,
+        max_length=max_length,
+        stride=stride,
+        padding=False,   # vi paddar i collate
+    )
 
-                for term in flat_results:
-                    entity = term.get("entity", "")
-                    word = term.get("word", "")
+    input_ids_list = enc["input_ids"]
+    attention_list = enc["attention_mask"]
+    offsets_list = enc["offset_mapping"]
 
-                    # B-LOC → start på en ny plats
-                    if entity.startswith("B-LOC"):
-                        self.loclist.append(word)
+    id2label = model.config.id2label
 
-                    # I-LOC → fortsättning på föregående plats
-                    elif entity.startswith("I-LOC"):
-                        try:
-                            self.loclist[-1] += " " + word
-                        except IndexError:
-                            # I-LOC utan föregående B-LOC
-                            print(f"[WARN] I-LOC utan B-LOC i fil {self.title}")
-            except RuntimeError as e:
-                # T.ex. CUDA OOM, eller annat
-                self.errors += 1
-                print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
+    def collate(batch_indices):
+        # Pad till samma längd i batchen
+        max_len = max(len(input_ids_list[i]) for i in batch_indices)
+        input_ids = []
+        attn = []
+        offsets = []
 
+        for i in batch_indices:
+            ids = input_ids_list[i]
+            am = attention_list[i]
+            off = offsets_list[i]
+
+            pad_len = max_len - len(ids)
+            input_ids.append(ids + [tokenizer.pad_token_id] * pad_len)
+            attn.append(am + [0] * pad_len)
+            offsets.append(off + [(0, 0)] * pad_len)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=f"cuda:{device}")
+        attn = torch.tensor(attn, dtype=torch.long, device=f"cuda:{device}")
+        return input_ids, attn, offsets
+
+    # Hjälpare: bygg LOC-strängar från pred + offsets
+    def extract_locs_from_pred(pred_ids, offsets):
+        locs = []
+        current = None  # (start, end)
+
+        for pid, (s, e) in zip(pred_ids, offsets):
+            if s == e:  # special tokens/padding
+                continue
+
+            label = id2label[int(pid)]
+            if label.endswith("LOC") and label.startswith("B-"):
+                # starta ny entity
+                if current is not None:
+                    locs.append(text[current[0]:current[1]])
+                current = [s, e]
+
+            elif label.endswith("LOC") and label.startswith("I-"):
+                # fortsätt entity om vi har en
+                if current is None:
+                    current = [s, e]
+                else:
+                    current[1] = e
+            else:
+                # avsluta om vi var inne i LOC
+                if current is not None:
+                    locs.append(text[current[0]:current[1]])
+                    current = None
+
+        if current is not None:
+            locs.append(text[current[0]:current[1]])
+
+        return locs
+
+    # --- Inferens i batchar ---
+    try:
+        with torch.no_grad():
+            for start in range(0, len(input_ids_list), batch_size):
+                idxs = list(range(start, min(start + batch_size, len(input_ids_list))))
+                input_ids, attn, offsets_batch = collate(idxs)
+
+                # fp16-autocast (bra på A40/V100/T4)
+                if torch.cuda.is_available() and use_fp16:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        out = model(input_ids=input_ids, attention_mask=attn)
+                else:
+                    out = model(input_ids=input_ids, attention_mask=attn)
+
+                pred = out.logits.argmax(dim=-1).detach().cpu().tolist()
+
+                # plocka ut LOC från varje chunk i batchen
+                for pred_ids, offsets in zip(pred, offsets_batch):
+                    self.loclist.extend(extract_locs_from_pred(pred_ids, offsets))
+
+    except RuntimeError as e:
+        self.errors += 1
+        print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
 
 # ================================
 # 3. Hjälpfunktioner för multi-GPU
