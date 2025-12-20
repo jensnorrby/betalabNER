@@ -32,103 +32,86 @@ def create_ner_pipeline(device: int, model_name: str = "dslim/bert-base-NER", fp
     print(f"[GPU {device}] Modell laddad. fp16={bool(torch_dtype)}")
     return {"tokenizer": tokenizer, "model": model, "device": device, "fp16": fp16}
 
-# ================================
-# 2. YearWalk – bearbeta EN fil
-# ================================
+from pathlib import Path
+import torch
+
 class YearWalk:
     """
-    Läser in en textfil, kör NER i batchar och sparar alla LOC-entities.
-    Tar en redan skapad NER-pipeline för att slippa ladda modellen per fil.
+    Kör NER på en fil genom att:
+    1) tokenisera hela texten
+    2) dela upp i overlappande chunkar (overflow)
+    3) batcha inferens på GPU
+    4) extrahera LOC via offsets tillbaka till originaltexten
     """
-    def __init__(self, path: str, nlp, batch_size: int = 64):
+
+    def __init__(self, path: str, nlp, batch_size: int = 8, max_length: int = 384, stride: int = 64):
         self.path = path
         self.title = Path(path).name
         self.loclist = []
         self.errors = 0
+
         self.nlp = nlp
         self.batch_size = batch_size
+        self.max_length = max_length
+        self.stride = stride
+
+        # interna buffers (för att slippa scope-problem)
+        self._text = ""
+        self._input_ids_list = None
+        self._attention_mask_list = None
+        self._offset_mapping_list = None
 
         self._run()
 
-    def _run(self):
-    # --- Läs text ---
-    with open(self.path, "r", encoding="utf-8") as f:
-        text = f.read()
+    def _tokenize(self, tokenizer):
+        encodings = tokenizer(
+            self._text,
+            return_offsets_mapping=True,
+            return_overflowing_tokens=True,
+            truncation=True,
+            max_length=self.max_length,
+            stride=self.stride,
+            padding=False,
+        )
+        self._input_ids_list = encodings["input_ids"]
+        self._attention_mask_list = encodings["attention_mask"]
+        self._offset_mapping_list = encodings["offset_mapping"]
 
-    # nlp-objektet är en dict från create_ner_pipeline(...)
-    tokenizer = self.nlp["tokenizer"]
-    model = self.nlp["model"]
-    device = self.nlp["device"]
-    use_fp16 = bool(self.nlp.get("fp16", True))
-
-    # ----------------------------
-    # Tuning-parametrar
-    # ----------------------------
-    max_length = 384   # prova 512 på A40/V100
-    stride = 64
-    batch_size = getattr(self, "batch_size", 8)
-
-    # ----------------------------
-    # Tokenisera med overflow-chunkar
-    # ----------------------------
-    encodings = tokenizer(
-        text,
-        return_offsets_mapping=True,
-        return_overflowing_tokens=True,
-        truncation=True,
-        max_length=max_length,
-        stride=stride,
-        padding=False,
-    )
-
-    input_ids_list = encodings["input_ids"]
-    attention_mask_list = encodings["attention_mask"]
-    offset_mapping_list = encodings["offset_mapping"]
-
-    id2label = model.config.id2label
-
-    # ----------------------------
-    # Collate-funktion (padding per batch)
-    # ----------------------------
-    def collate(batch_indices):
-        max_len = max(len(input_ids_list[i]) for i in batch_indices)
+    def _collate(self, tokenizer, device: int, batch_indices):
+        # pad per batch
+        max_len = max(len(self._input_ids_list[i]) for i in batch_indices)
 
         input_ids = []
         attention_mask = []
         offsets = []
 
         for i in batch_indices:
-            ids = input_ids_list[i]
-            am = attention_mask_list[i]
-            off = offset_mapping_list[i]
+            ids = self._input_ids_list[i]
+            am = self._attention_mask_list[i]
+            off = self._offset_mapping_list[i]
 
             pad_len = max_len - len(ids)
-
             input_ids.append(ids + [tokenizer.pad_token_id] * pad_len)
             attention_mask.append(am + [0] * pad_len)
             offsets.append(off + [(0, 0)] * pad_len)
 
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=f"cuda:{device}")
         attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=f"cuda:{device}")
-
         return input_ids, attention_mask, offsets
 
-    # ----------------------------
-    # Extrahera LOC från prediktioner
-    # ----------------------------
-    def extract_locs(pred_ids, offsets):
+    def _extract_locs(self, pred_ids, offsets, id2label):
         locs = []
         current = None  # [start, end]
 
         for pid, (s, e) in zip(pred_ids, offsets):
-            if s == e:
+            if s == e:  # padding/special tokens
                 continue
 
             label = id2label[int(pid)]
 
             if label.startswith("B-") and label.endswith("LOC"):
                 if current is not None:
-                    locs.append(text[current[0]:current[1]])
+                    locs.append(self._text[current[0]:current[1]])
                 current = [s, e]
 
             elif label.startswith("I-") and label.endswith("LOC"):
@@ -139,40 +122,52 @@ class YearWalk:
 
             else:
                 if current is not None:
-                    locs.append(text[current[0]:current[1]])
+                    locs.append(self._text[current[0]:current[1]])
                     current = None
 
         if current is not None:
-            locs.append(text[current[0]:current[1]])
+            locs.append(self._text[current[0]:current[1]])
 
         return locs
 
-    # ----------------------------
-    # Inferens-loop
-    # ----------------------------
-    try:
-        with torch.no_grad():
-            n_chunks = len(input_ids_list)
+    def _run(self):
+        # --- Läs text ---
+        with open(self.path, "r", encoding="utf-8") as f:
+            self._text = f.read()
 
-            for start in range(0, n_chunks, batch_size):
-                batch_indices = list(range(start, min(start + batch_size, n_chunks)))
+        tokenizer = self.nlp["tokenizer"]
+        model = self.nlp["model"]
+        device = self.nlp["device"]
+        use_fp16 = bool(self.nlp.get("fp16", True))
 
-                input_ids, attention_mask, offsets_batch = collate(batch_indices)
+        # --- Tokenisera ---
+        self._tokenize(tokenizer)
 
-                if torch.cuda.is_available() and use_fp16:
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        # --- Inferens ---
+        id2label = model.config.id2label
+
+        try:
+            with torch.no_grad():
+                n_chunks = len(self._input_ids_list)
+
+                for start in range(0, n_chunks, self.batch_size):
+                    batch_indices = list(range(start, min(start + self.batch_size, n_chunks)))
+                    input_ids, attention_mask, offsets_batch = self._collate(tokenizer, device, batch_indices)
+
+                    if torch.cuda.is_available() and use_fp16:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    else:
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                else:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-                predictions = outputs.logits.argmax(dim=-1).detach().cpu().tolist()
+                    predictions = outputs.logits.argmax(dim=-1).detach().cpu().tolist()
 
-                for pred_ids, offsets in zip(predictions, offsets_batch):
-                    self.loclist.extend(extract_locs(pred_ids, offsets))
+                    for pred_ids, offsets in zip(predictions, offsets_batch):
+                        self.loclist.extend(self._extract_locs(pred_ids, offsets, id2label))
 
-    except RuntimeError as e:
-        self.errors += 1
-        print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
+        except RuntimeError as e:
+            self.errors += 1
+            print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
 
 
 # ================================
