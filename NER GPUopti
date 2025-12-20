@@ -55,80 +55,89 @@ class YearWalk:
     with open(self.path, "r", encoding="utf-8") as f:
         text = f.read()
 
-    # self.nlp är nu en dict från create_ner_pipeline(...)
+    # nlp-objektet är en dict från create_ner_pipeline(...)
     tokenizer = self.nlp["tokenizer"]
     model = self.nlp["model"]
     device = self.nlp["device"]
     use_fp16 = bool(self.nlp.get("fp16", True))
 
-    # --- Tuning-parametrar (VIKTIGA för speed) ---
-    # Öka max_length om du har VRAM (A40 klarar oftast 512 lättare än T4).
-    max_length = 512   # 384, prova 512 på A40/V100 om det ryms
-    stride = 64        # overlap så entities över gränser fångas
-    batch_size = getattr(self, "batch_size", 8)  # per GPU-process
+    # ----------------------------
+    # Tuning-parametrar
+    # ----------------------------
+    max_length = 384   # prova 512 på A40/V100
+    stride = 64
+    batch_size = getattr(self, "batch_size", 8)
 
-    # Tokenisera med overflow-chunkar + offset mapping
-    enc = tokenizer(
+    # ----------------------------
+    # Tokenisera med overflow-chunkar
+    # ----------------------------
+    encodings = tokenizer(
         text,
         return_offsets_mapping=True,
         return_overflowing_tokens=True,
         truncation=True,
         max_length=max_length,
         stride=stride,
-        padding=False,   # vi paddar i collate
+        padding=False,
     )
 
-    input_ids_list = enc["input_ids"]
-    attention_list = enc["attention_mask"]
-    offsets_list = enc["offset_mapping"]
+    input_ids_list = encodings["input_ids"]
+    attention_mask_list = encodings["attention_mask"]
+    offset_mapping_list = encodings["offset_mapping"]
 
     id2label = model.config.id2label
 
+    # ----------------------------
+    # Collate-funktion (padding per batch)
+    # ----------------------------
     def collate(batch_indices):
-        # Pad till samma längd i batchen
         max_len = max(len(input_ids_list[i]) for i in batch_indices)
+
         input_ids = []
-        attn = []
+        attention_mask = []
         offsets = []
 
         for i in batch_indices:
             ids = input_ids_list[i]
-            am = attention_list[i]
-            off = offsets_list[i]
+            am = attention_mask_list[i]
+            off = offset_mapping_list[i]
 
             pad_len = max_len - len(ids)
+
             input_ids.append(ids + [tokenizer.pad_token_id] * pad_len)
-            attn.append(am + [0] * pad_len)
+            attention_mask.append(am + [0] * pad_len)
             offsets.append(off + [(0, 0)] * pad_len)
 
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=f"cuda:{device}")
-        attn = torch.tensor(attn, dtype=torch.long, device=f"cuda:{device}")
-        return input_ids, attn, offsets
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=f"cuda:{device}")
 
-    # Hjälpare: bygg LOC-strängar från pred + offsets
-    def extract_locs_from_pred(pred_ids, offsets):
+        return input_ids, attention_mask, offsets
+
+    # ----------------------------
+    # Extrahera LOC från prediktioner
+    # ----------------------------
+    def extract_locs(pred_ids, offsets):
         locs = []
-        current = None  # (start, end)
+        current = None  # [start, end]
 
         for pid, (s, e) in zip(pred_ids, offsets):
-            if s == e:  # special tokens/padding
+            if s == e:
                 continue
 
             label = id2label[int(pid)]
-            if label.endswith("LOC") and label.startswith("B-"):
-                # starta ny entity
+
+            if label.startswith("B-") and label.endswith("LOC"):
                 if current is not None:
                     locs.append(text[current[0]:current[1]])
                 current = [s, e]
 
-            elif label.endswith("LOC") and label.startswith("I-"):
-                # fortsätt entity om vi har en
+            elif label.startswith("I-") and label.endswith("LOC"):
                 if current is None:
                     current = [s, e]
                 else:
                     current[1] = e
+
             else:
-                # avsluta om vi var inne i LOC
                 if current is not None:
                     locs.append(text[current[0]:current[1]])
                     current = None
@@ -138,29 +147,33 @@ class YearWalk:
 
         return locs
 
-    # --- Inferens i batchar ---
+    # ----------------------------
+    # Inferens-loop
+    # ----------------------------
     try:
         with torch.no_grad():
-            for start in range(0, len(input_ids_list), batch_size):
-                idxs = list(range(start, min(start + batch_size, len(input_ids_list))))
-                input_ids, attn, offsets_batch = collate(idxs)
+            n_chunks = len(input_ids_list)
 
-                # fp16-autocast (bra på A40/V100/T4)
+            for start in range(0, n_chunks, batch_size):
+                batch_indices = list(range(start, min(start + batch_size, n_chunks)))
+
+                input_ids, attention_mask, offsets_batch = collate(batch_indices)
+
                 if torch.cuda.is_available() and use_fp16:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        out = model(input_ids=input_ids, attention_mask=attn)
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 else:
-                    out = model(input_ids=input_ids, attention_mask=attn)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-                pred = out.logits.argmax(dim=-1).detach().cpu().tolist()
+                predictions = outputs.logits.argmax(dim=-1).detach().cpu().tolist()
 
-                # plocka ut LOC från varje chunk i batchen
-                for pred_ids, offsets in zip(pred, offsets_batch):
-                    self.loclist.extend(extract_locs_from_pred(pred_ids, offsets))
+                for pred_ids, offsets in zip(predictions, offsets_batch):
+                    self.loclist.extend(extract_locs(pred_ids, offsets))
 
     except RuntimeError as e:
         self.errors += 1
         print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
+
 
 # ================================
 # 3. Hjälpfunktioner för multi-GPU
