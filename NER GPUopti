@@ -191,47 +191,60 @@ class YearWalk:
             print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
 
 
-# ================================
-# 3. Hjälpfunktioner för multi-GPU
-# ================================
+# ----------------------------
+# 3) Multi-GPU helpers
+# ----------------------------
 def chunk_list(lst, n):
-    """
-    Dela upp lst i n ungefär lika stora bitar.
-    Om lst är kortare än n blir vissa chunkar tomma, vilket också är okej.
-    """
     if n <= 0:
         return [lst]
-    k = ceil(len(lst) / n) if len(lst) > 0 else 1
-    return [lst[i:i + k] for i in range(0, len(lst), k)]
+    if len(lst) == 0:
+        return [[] for _ in range(n)]
+    k = ceil(len(lst) / n)
+    chunks = [lst[i:i + k] for i in range(0, len(lst), k)]
+    # fyll upp med tomma listor om vi fick färre chunkar än n
+    while len(chunks) < n:
+        chunks.append([])
+    return chunks[:n]
 
 
-def worker_gpu(gpu_id: int, file_list, year: str, out_dir: str, batch_size: int = 64):
-    """
-    Körs i en separat process per GPU.
-    - Laddar en NER-pipeline på (gpu_id)
-    - Bearbetar alla filer i file_list
-    - Skriver ut en partial-fil: {year}_gpu{gpu_id}.json
-    """
-    if len(file_list) == 0:
+def worker_gpu(gpu_id: int,
+               file_list,
+               year: str,
+               out_dir: str,
+               model_name: str,
+               fp16: bool,
+               batch_size: int,
+               max_length: int,
+               stride: int):
+    if not file_list:
         print(f"[GPU {gpu_id}] Inga filer tilldelade, hoppar över.")
         return
 
-    print(f"[GPU {gpu_id}] Startar worker med {len(file_list)} filer för år {year}")
-    nlp = create_ner_pipeline(device=gpu_id)
+    # Bind processen tydligt till en GPU
+    torch.cuda.set_device(gpu_id)
+
+    print(f"[GPU {gpu_id}] Startar worker: {len(file_list)} filer (år {year})")
+    nlp = create_ner_pipeline(device=gpu_id, model_name=model_name, fp16=fp16)
 
     all_locs = []
     total_errors = 0
 
     for fpath in file_list:
-        yw = YearWalk(fpath, nlp=nlp, batch_size=batch_size)
+        yw = YearWalk(
+            fpath,
+            nlp=nlp,
+            batch_size=batch_size,
+            max_length=max_length,
+            stride=stride
+        )
         all_locs.extend(yw.loclist)
         total_errors += yw.errors
-        print(f"[GPU {gpu_id}] Klar med {Path(fpath).name}, errors={yw.errors}, locations={len(yw.loclist)}")
+        print(f"[GPU {gpu_id}] Klar: {Path(fpath).name} | locs={len(yw.loclist)} | errors={yw.errors}")
 
     out_dir = Path(out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-
     out_file = out_dir / f"{year}_gpu{gpu_id}.json"
+
     with out_file.open("w", encoding="utf-8") as f:
         json.dump(
             {"year": year, "gpu": gpu_id, "locs": all_locs, "errors": total_errors},
@@ -240,96 +253,100 @@ def worker_gpu(gpu_id: int, file_list, year: str, out_dir: str, batch_size: int 
             indent=2
         )
 
-    print(f"[GPU {gpu_id}] Klart! Skrev {out_file} (total locations: {len(all_locs)}, errors: {total_errors})")
+    print(f"[GPU {gpu_id}] Skrev {out_file} | total locs={len(all_locs)} | total errors={total_errors}")
 
 
-def merge_outputs(year: str, out_dir: str = "~/ner_outputs", final_suffix: str = ""):
-    """
-    Slår ihop alla {year}_gpu*.json från out_dir till en enda fil {year}{final_suffix}.json.
-    """
+def merge_outputs(year: str, out_dir: str, final_name: str = None):
     out_dir = Path(out_dir).expanduser()
+    files = sorted(out_dir.glob(f"{year}_gpu*.json"))
+    if not files:
+        print(f"Inga partial-filer hittades för {year} i {out_dir}")
+        return None
+
     locs = []
-    total_errors = 0
-
-    json_files = sorted(out_dir.glob(f"{year}_gpu*.json"))
-    if not json_files:
-        print(f"Inga partial-filer hittades för år {year} i {out_dir}")
-        return
-
-    for file in json_files:
-        with file.open(encoding="utf-8") as f:
+    errors = 0
+    for fp in files:
+        with fp.open("r", encoding="utf-8") as f:
             data = json.load(f)
         locs.extend(data.get("locs", []))
-        total_errors += data.get("errors", 0)
+        errors += int(data.get("errors", 0))
 
-    final_name = f"{year}{final_suffix}.json" if final_suffix else f"{year}.json"
+    if final_name is None:
+        final_name = f"{year}.json"
     final_path = out_dir / final_name
+
     with final_path.open("w", encoding="utf-8") as f:
-        json.dump({"year": year, "locs": locs, "errors": total_errors}, f, ensure_ascii=False, indent=2)
+        json.dump({"year": year, "locs": locs, "errors": errors}, f, ensure_ascii=False, indent=2)
 
-    print(f"Slutresultat i {final_path}")
-    print(f"Totalt locations: {len(locs)}, total errors: {total_errors}")
+    print(f"MERGE klar: {final_path} | locs={len(locs)} | errors={errors}")
+    return final_path
 
 
-# ================================
-# 4. Huvudflöde (multi-GPU körning)
-# ================================
+
+# ----------------------------
+# 4) Main
+# ----------------------------
 if __name__ == "__main__":
-    # ----------------------------
-    # Konfiguration
-    # ----------------------------
-    # Bas-katalog för ett år, t.ex. ~/Words/1866
-    base_path = "~/Words/1866"   # ändra till din katalog
-    out_dir = "~/ner_outputs"    # var NER-resultaten ska sparas
-    batch_size = 64              # kan ökas om du har gott om GPU-minne
+    # --- KONFIG ---
+    base_path = "~/Words/1866"       # katalogen för året
+    out_dir = "~/ner_outputs"        # resultatkatalog
+    model_name = "dslim/bert-base-NER"
+    fp16 = True
 
-    # ----------------------------
-    # Förbered
-    # ----------------------------
+    # Chunkning/inferens-parametrar:
+    max_length = 384   # prova 512 på A40/V100 om du har VRAM
+    stride = 64
+    batch_size = 16    # startvärde; höj på A40/V100 tills det nästan tar slut på VRAM
+
+    # Begränsa antal GPU:er om du vill
+    max_gpus = 8
+
+    # --- DIAGNOSTIK ---
+    print_cuda_diagnostics()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "PyTorch hittar ingen GPU/CUDA i den här miljön.\n"
+            "Vanliga orsaker: du kör på en CPU-nod, eller har CPU-build av PyTorch, "
+            "eller fel conda/venv är aktiv."
+        )
+
     base_path = Path(base_path).expanduser()
-    year = base_path.name  # "1866"
+    year = base_path.name
 
-    # Hämta alla filer i katalogen
-    files = [str(f) for f in base_path.iterdir() if f.is_file()]
-    files = sorted(files)
-
+    files = sorted([str(p) for p in base_path.iterdir() if p.is_file()])
     if not files:
         raise RuntimeError(f"Inga filer hittades i {base_path}")
 
-    # Hur många GPUs har vi?
     available_gpus = torch.cuda.device_count()
-    if available_gpus == 0:
-        raise RuntimeError("Inga GPUs hittades. Kontrollera CUDA-installation & drivrutiner.")
-
-    # Om du vill begränsa antal GPUs (t.ex. max 8):
-    max_gpus = 8
     num_gpus = min(available_gpus, max_gpus)
 
-    print(f"Hittade {len(files)} filer för år {year}")
-    print(f"Använder {num_gpus} GPU(s) av {available_gpus} tillgängliga.")
+    print(f"År: {year}")
+    print(f"Filer: {len(files)}")
+    print(f"GPU:er tillgängliga: {available_gpus} | använder: {num_gpus}")
 
-    # Dela upp filerna i num_gpus chunkar
     file_chunks = chunk_list(files, num_gpus)
 
-    # ----------------------------
-    # Starta en process per GPU
-    # ----------------------------
     procs = []
-    for gpu_id, chunk in enumerate(file_chunks[:num_gpus]):
+    for gpu_id in range(num_gpus):
         p = Process(
             target=worker_gpu,
-            args=(gpu_id, chunk, year, out_dir, batch_size)
+            args=(
+                gpu_id,
+                file_chunks[gpu_id],
+                year,
+                out_dir,
+                model_name,
+                fp16,
+                batch_size,
+                max_length,
+                stride
+            )
         )
         p.start()
         procs.append(p)
 
-    # Vänta tills alla processer är klara
     for p in procs:
         p.join()
 
-    print("Alla worker-processer är klara.")
-
-    # ----------------------------
-    # Slå ihop partial-filer
-    # ----------------------------
-    merge_outputs(year=year, out_dir=out_dir)
+    merge_outputs(year, out_dir)
