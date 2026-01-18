@@ -36,6 +36,80 @@ def print_cuda_diagnostics():
 # ================================
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
+# ----------------------------
+    # KONFIG
+    # ----------------------------
+    root_dir = Path("~/Words").expanduser()   # katalog som innehåller alla år
+    out_dir = "/home/<USER>/ner_outputs"      # ABSOLUT sökväg rekommenderas
+    model_name = "dslim/bert-base-NER"
+    fp16 = True
+
+    max_length = 512      # bra på V100/A40
+    stride = 64
+    batch_size = 16
+    max_gpus = 8
+
+    # ----------------------------
+    # Hitta alla år
+    # ----------------------------
+    year_dirs = sorted(
+        d for d in root_dir.iterdir()
+        if d.is_dir() and d.name.isdigit()
+    )
+
+    if not year_dirs:
+        raise RuntimeError(f"Inga årskataloger hittades i {root_dir}")
+
+    print(f"Hittade {len(year_dirs)} år:", [d.name for d in year_dirs])
+
+    available_gpus = torch.cuda.device_count()
+    if available_gpus == 0:
+        raise RuntimeError("Inga GPU:er hittades")
+
+    num_gpus = min(available_gpus, max_gpus)
+
+    # ----------------------------
+    # Kör ett år i taget
+    # ----------------------------
+    for year_path in year_dirs:
+        year = year_path.name
+        print(f"\n==============================")
+        print(f"Startar år {year}")
+        print(f"==============================")
+
+        files = sorted(str(p) for p in year_path.iterdir() if p.is_file())
+        if not files:
+            print(f"Inga filer i {year_path}, hoppar över")
+            continue
+
+        file_chunks = chunk_list(files, min(num_gpus, len(files)))
+        procs = []
+
+        for gpu_id, chunk in enumerate(file_chunks):
+            p = mp.Process(
+                target=worker_gpu,
+                args=(
+                    gpu_id,
+                    chunk,
+                    year,
+                    out_dir,
+                    model_name,
+                    fp16,
+                    batch_size,
+                    max_length,
+                    stride
+                )
+            )
+            p.start()
+            procs.append(p)
+
+        for p in procs:
+            p.join()
+
+        merge_outputs(year, out_dir)
+
+        print(f"År {year} klart ✔")
+
 def create_ner_pipeline(device: int, model_name: str = "dslim/bert-base-NER", fp16: bool = True):
     """
     Skapar model+tokenizer för token-classification på angiven GPU.
