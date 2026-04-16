@@ -1,0 +1,550 @@
+import os
+import re
+import json
+import argparse
+import multiprocessing as mp
+from pathlib import Path
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from kblab import Archive
+
+
+BETALAB_URL = "https://betalab.kb.se"
+MODEL_NAME = "KB/bert-base-swedish-cased-ner"
+
+DEFAULT_CREDENTIALS_PATH = Path("~/Betalab/api_credentials.txt").expanduser()
+DEFAULT_OUT_DIR = Path("~/ner_outputs_direct").expanduser()
+
+DEFAULT_MAX_LENGTH = 384
+DEFAULT_STRIDE = 64
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_FETCH_THREADS = 4
+
+TITLE_LIST = [
+    "Aftonbladet",
+    "Dagens Nyheter",
+    "Expressen",
+    "Göteborgsposten",
+    "Arbetet",
+    "Göteborgs Handels- och Sjöfartstidning",
+    "Haparandabladet",
+    "Norbottens-Kuriren",
+    "Stockholms Dagblad",
+    "Svenska Dagbladet",
+    "Sydsvenska Dagbladet",
+]
+
+
+def print_cuda_diagnostics():
+    print("=== CUDA Diagnostics ===")
+    print("torch.__version__:", torch.__version__)
+    print("torch.version.cuda:", torch.version.cuda)
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("torch.cuda.is_available():", torch.cuda.is_available())
+    print("torch.cuda.device_count():", torch.cuda.device_count())
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    print("========================\n")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run Swedish NER on KB text directly and save yearly location counts.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--year", type=int, help="Run a single year, e.g. --year 1950")
+    group.add_argument("--start-year", type=int, help="Start year, inclusive")
+
+    parser.add_argument("--end-year", type=int, help="End year, inclusive. Required with --start-year")
+    parser.add_argument("--credentials-path", type=str, default=str(DEFAULT_CREDENTIALS_PATH))
+    parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUT_DIR))
+
+    parser.add_argument("--max-gpus", type=int, default=None, help="Maximum number of GPUs to use")
+    parser.add_argument("--fetch-threads", type=int, default=DEFAULT_FETCH_THREADS)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE)
+
+    parser.add_argument("--fp16", action="store_true", help="Use fp16 on GPU")
+    parser.add_argument("--keep-partials", action="store_true", help="Keep partial files after merge")
+    parser.add_argument("--titles", nargs="*", default=TITLE_LIST, help="Override titles list")
+    parser.add_argument("--limit-packages", type=int, default=None, help="Optional test limit on number of packages per year")
+
+    args = parser.parse_args()
+
+    if args.start_year is not None and args.end_year is None:
+        parser.error("--end-year is required when using --start-year")
+
+    if args.end_year is not None and args.start_year is None:
+        parser.error("--start-year is required when using --end-year")
+
+    if args.year is not None:
+        args.years = [str(args.year)]
+    else:
+        if args.end_year < args.start_year:
+            parser.error("--end-year must be >= --start-year")
+        args.years = [str(y) for y in range(args.start_year, args.end_year + 1)]
+
+    return args
+
+
+def load_password(credentials_path: Path) -> str:
+    with credentials_path.open("r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def make_archive(password: str) -> Archive:
+    return Archive(BETALAB_URL, auth=("demo", password))
+
+
+def chunk_list(lst, n):
+    if not lst:
+        return [[] for _ in range(max(1, n))]
+    n = max(1, n)
+    chunk_size = (len(lst) + n - 1) // n
+    chunks = [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
+    while len(chunks) < n:
+        chunks.append([])
+    return chunks[:n]
+
+
+def normalize_location(name: str) -> str | None:
+    if not name:
+        return None
+
+    s = name.strip()
+
+    # ta bort extra skiljetecken runtom
+    s = re.sub(r"^[\s\.,;:!\?\)\]\}\'\"»«„“]+", "", s)
+    s = re.sub(r"[\s\.,;:!\?\(\[\{\'\"»«„“]+$", "", s)
+
+    # komprimera whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if not s:
+        return None
+
+    # normalisera märkliga versaler: endast första bokstaven i varje ord versal
+    # behåller bindestreck och mellanrum hyggligt
+    def titlecase_token(token: str) -> str:
+        parts = token.split("-")
+        parts = [p[:1].upper() + p[1:].lower() if p else p for p in parts]
+        return "-".join(parts)
+
+    tokens = s.split(" ")
+    s = " ".join(titlecase_token(tok) for tok in tokens)
+
+    if not s:
+        return None
+
+    return s
+
+
+def create_model_and_tokenizer(model_name: str, gpu_id: int, fp16: bool):
+    print(f"[GPU {gpu_id}] Loading model: {model_name}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    torch_dtype = torch.float16 if (fp16 and torch.cuda.is_available()) else None
+
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_name,
+        torch_dtype=torch_dtype
+    )
+
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+
+    print(f"[GPU {gpu_id}] Model ready on {device}")
+    return tokenizer, model, device
+
+
+class DirectTextNER:
+    def __init__(self, tokenizer, model, device, batch_size=8, max_length=384, stride=64):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = device
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self.stride = stride
+
+    def _tokenize(self, text: str):
+        return self.tokenizer(
+            text,
+            return_offsets_mapping=True,
+            return_overflowing_tokens=True,
+            truncation=True,
+            max_length=self.max_length,
+            stride=self.stride,
+            padding=False,
+        )
+
+    def _collate(self, input_ids_list, attention_mask_list, offset_mapping_list, batch_indices):
+        max_len = max(len(input_ids_list[i]) for i in batch_indices)
+
+        input_ids = []
+        attention_mask = []
+        offsets = []
+
+        for i in batch_indices:
+            ids = input_ids_list[i]
+            am = attention_mask_list[i]
+            off = offset_mapping_list[i]
+
+            pad_len = max_len - len(ids)
+            input_ids.append(ids + [self.tokenizer.pad_token_id] * pad_len)
+            attention_mask.append(am + [0] * pad_len)
+            offsets.append(off + [(0, 0)] * pad_len)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=self.device)
+
+        return input_ids, attention_mask, offsets
+
+    def _extract_locs(self, text, pred_ids, offsets, id2label):
+        locs = []
+        current = None
+
+        for pid, (s, e) in zip(pred_ids, offsets):
+            if s == e:
+                continue
+
+            label = id2label[int(pid)]
+
+            if label.startswith("B-") and label.endswith("LOC"):
+                if current is not None:
+                    locs.append(text[current[0]:current[1]])
+                current = [s, e]
+
+            elif label.startswith("I-") and label.endswith("LOC"):
+                if current is None:
+                    current = [s, e]
+                else:
+                    current[1] = e
+
+            else:
+                if current is not None:
+                    locs.append(text[current[0]:current[1]])
+                    current = None
+
+        if current is not None:
+            locs.append(text[current[0]:current[1]])
+
+        return locs
+
+    def extract_locations(self, text: str):
+        if not text or not text.strip():
+            return []
+
+        enc = self._tokenize(text)
+        input_ids_list = enc["input_ids"]
+        attention_mask_list = enc["attention_mask"]
+        offset_mapping_list = enc["offset_mapping"]
+
+        id2label = self.model.config.id2label
+        all_locs = []
+
+        with torch.no_grad():
+            n_chunks = len(input_ids_list)
+
+            for start in range(0, n_chunks, self.batch_size):
+                batch_indices = list(range(start, min(start + self.batch_size, n_chunks)))
+
+                input_ids, attention_mask, offsets_batch = self._collate(
+                    input_ids_list,
+                    attention_mask_list,
+                    offset_mapping_list,
+                    batch_indices
+                )
+
+                if self.device.startswith("cuda"):
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                else:
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+                predictions = outputs.logits.argmax(dim=-1).detach().cpu().tolist()
+
+                for pred_ids, offsets in zip(predictions, offsets_batch):
+                    all_locs.extend(self._extract_locs(text, pred_ids, offsets, id2label))
+
+        return all_locs
+
+
+def get_package_ids_for_year(password: str, titles: list[str], year: str, limit_packages: int | None = None):
+    archive = make_archive(password)
+    package_ids = []
+
+    for title in titles:
+        query = f'label: "{title}" meta.created: "{year}"'
+        print(f"[YEAR {year}] Searching: {query}")
+
+        for package_id in archive.search(query):
+            package_ids.append(package_id)
+            if limit_packages is not None and len(package_ids) >= limit_packages:
+                print(f"[YEAR {year}] Reached limit-packages={limit_packages}")
+                return package_ids
+
+    print(f"[YEAR {year}] Total package_ids: {len(package_ids)}")
+    return package_ids
+
+
+def fetch_texts_from_package(package_id: str, password: str):
+    archive = make_archive(password)
+    texts = []
+
+    try:
+        package = archive.get(package_id)
+
+        if "content.json" not in package:
+            return texts
+
+        content_json = json.load(package.get_raw("content.json"))
+
+        if isinstance(content_json, list):
+            for item in content_json:
+                content = item.get("content")
+                if isinstance(content, str) and content.strip():
+                    texts.append(content)
+
+    except Exception as e:
+        print(f"[WARN] Failed package {package_id}: {e}")
+
+    return texts
+
+
+def gpu_worker(
+    gpu_id: int,
+    year: str,
+    package_ids: list[str],
+    password: str,
+    out_dir: str,
+    batch_size: int,
+    max_length: int,
+    stride: int,
+    fetch_threads: int,
+    fp16: bool,
+):
+    if not package_ids:
+        print(f"[GPU {gpu_id}] No package_ids for year {year}")
+        return
+
+    torch.cuda.set_device(gpu_id)
+
+    tokenizer, model, device = create_model_and_tokenizer(MODEL_NAME, gpu_id, fp16)
+    ner = DirectTextNER(
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        batch_size=batch_size,
+        max_length=max_length,
+        stride=stride,
+    )
+
+    loc_counter = Counter()
+    errors = 0
+
+    print(f"[GPU {gpu_id}] Starting year={year}, packages={len(package_ids)}")
+
+    with ThreadPoolExecutor(max_workers=fetch_threads) as ex:
+        futures = {
+            ex.submit(fetch_texts_from_package, package_id, password): package_id
+            for package_id in package_ids
+        }
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            package_id = futures[fut]
+
+            try:
+                texts = fut.result()
+            except Exception as e:
+                errors += 1
+                print(f"[GPU {gpu_id}] ERROR future {package_id}: {e}")
+                continue
+
+            for text in texts:
+                try:
+                    locs = ner.extract_locations(text)
+                    for loc in locs:
+                        norm = normalize_location(loc)
+                        if norm:
+                            loc_counter[norm] += 1
+                except RuntimeError as e:
+                    errors += 1
+                    print(f"[GPU {gpu_id}] RuntimeError {package_id}: {e}")
+                except Exception as e:
+                    errors += 1
+                    print(f"[GPU {gpu_id}] General error {package_id}: {e}")
+
+            if i % 100 == 0:
+                print(
+                    f"[GPU {gpu_id}] year={year} "
+                    f"{i}/{len(package_ids)} packages done | "
+                    f"errors={errors} | unique_locs={len(loc_counter)}"
+                )
+
+    out_dir = Path(out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    partial_path = out_dir / f"{year}_gpu{gpu_id}.json"
+
+    with partial_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "year": year,
+                "gpu": gpu_id,
+                "errors": errors,
+                "loc_counts": dict(loc_counter)
+            },
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    print(f"[GPU {gpu_id}] Finished: {partial_path}")
+
+
+def merge_year_outputs(year: str, out_dir: str, keep_partials: bool):
+    out_dir = Path(out_dir).expanduser()
+    partials = sorted(out_dir.glob(f"{year}_gpu*.json"))
+
+    if not partials:
+        print(f"[MERGE] No partial files found for year {year}")
+        return None
+
+    total_errors = 0
+    merged_counter = Counter()
+
+    for fp in partials:
+        with fp.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        total_errors += int(data.get("errors", 0))
+        merged_counter.update(data.get("loc_counts", {}))
+
+    final_path = out_dir / f"{year}.json"
+    with final_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "year": year,
+                "errors": total_errors,
+                "loc_counts": dict(merged_counter.most_common())
+            },
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    print(f"[MERGE] Wrote final file: {final_path}")
+
+    if not keep_partials:
+        for fp in partials:
+            try:
+                fp.unlink()
+            except Exception as e:
+                print(f"[MERGE] Could not delete partial {fp}: {e}")
+
+    return final_path
+
+
+def run_year(
+    year: str,
+    password: str,
+    out_dir: str,
+    titles: list[str],
+    max_gpus: int | None,
+    fetch_threads: int,
+    batch_size: int,
+    max_length: int,
+    stride: int,
+    fp16: bool,
+    keep_partials: bool,
+    limit_packages: int | None,
+):
+    package_ids = get_package_ids_for_year(password, titles, year, limit_packages=limit_packages)
+
+    if not package_ids:
+        print(f"[YEAR {year}] No package_ids found, skipping.")
+        return
+
+    available_gpus = torch.cuda.device_count()
+    if available_gpus == 0:
+        raise RuntimeError("No GPUs found.")
+
+    usable_gpus = available_gpus if max_gpus is None else min(available_gpus, max_gpus)
+    usable_gpus = min(usable_gpus, len(package_ids))
+    usable_gpus = max(1, usable_gpus)
+
+    print(f"[YEAR {year}] Using {usable_gpus} GPU(s)")
+    chunks = chunk_list(package_ids, usable_gpus)
+
+    procs = []
+    for gpu_id, package_chunk in enumerate(chunks):
+        p = mp.Process(
+            target=gpu_worker,
+            args=(
+                gpu_id,
+                year,
+                package_chunk,
+                password,
+                out_dir,
+                batch_size,
+                max_length,
+                stride,
+                fetch_threads,
+                fp16,
+            )
+        )
+        p.start()
+        procs.append(p)
+
+    exitcodes = []
+    for p in procs:
+        p.join()
+        exitcodes.append(p.exitcode)
+
+    bad = [code for code in exitcodes if code != 0]
+    if bad:
+        raise RuntimeError(f"[YEAR {year}] One or more GPU workers failed. Exit codes: {exitcodes}")
+
+    merge_year_outputs(year, out_dir, keep_partials=keep_partials)
+
+
+def main():
+    args = parse_args()
+    mp.set_start_method("spawn", force=True)
+
+    credentials_path = Path(args.credentials_path).expanduser()
+    out_dir = Path(args.out_dir).expanduser()
+    password = load_password(credentials_path)
+
+    print_cuda_diagnostics()
+    print("Years:", args.years)
+    print("Output dir:", out_dir)
+    print("Model:", MODEL_NAME)
+    print("Titles:", args.titles)
+    print()
+
+    for year in args.years:
+        print("=" * 80)
+        print(f"STARTING YEAR {year}")
+        print("=" * 80)
+        run_year(
+            year=year,
+            password=password,
+            out_dir=str(out_dir),
+            titles=args.titles,
+            max_gpus=args.max_gpus,
+            fetch_threads=args.fetch_threads,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            stride=args.stride,
+            fp16=args.fp16,
+            keep_partials=args.keep_partials,
+            limit_packages=args.limit_packages,
+        )
+
+
+if __name__ == "__main__":
+    main()
