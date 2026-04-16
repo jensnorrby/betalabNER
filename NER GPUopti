@@ -39,8 +39,8 @@ from transformers import AutoTokenizer, AutoModelForTokenClassification
 # ----------------------------
     # KONFIG
     # ----------------------------
-    root_dir = Path("~/Words").expanduser()   # katalog som innehåller alla år
-    out_dir = "/home/<USER>/ner_outputs"      # ABSOLUT sökväg rekommenderas
+    root_dir = Path("/data/Words").expanduser()   # katalog som innehåller alla år
+    out_dir = "/home/jens/documents/NER"      # ABSOLUT sökväg rekommenderas
     model_name = "dslim/bert-base-NER"
     fp16 = True
 
@@ -362,8 +362,8 @@ def merge_outputs(year: str, out_dir: str, final_name: str = None):
 # ----------------------------
 if __name__ == "__main__":
     # --- KONFIG ---
-    base_path = "~/Words/1866"       # katalogen för året
-    out_dir = "~/ner_outputs"        # resultatkatalog
+    base_path = "~/Words/1907"       # katalogen för året
+    out_dir = "~/NER"        # resultatkatalog
     model_name = "dslim/bert-base-NER"
     fp16 = True
 
