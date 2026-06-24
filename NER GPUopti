@@ -1,166 +1,143 @@
-# ================================
-# 0. Importer
-# ================================
-from pathlib import Path
-from itertools import chain
-from math import ceil
-from multiprocessing import Process
+import os
+import re
 import json
-import torch
-from transformers import pipeline
+import argparse
+import multiprocessing as mp
+from pathlib import Path
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ----------------------------
-# 0) Diagnostik: vad ser PyTorch?
-# ----------------------------
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from kblab import Archive
+
+
+BETALAB_URL = "https://betalab.kb.se"
+MODEL_NAME = "KB/bert-base-swedish-cased-ner"
+
+OUT_DIR = Path("~/ner_outputs_direct").expanduser()
+
+TITLE_LIST = [
+    "Aftonbladet",
+    "Dagens Nyheter",
+    "Expressen",
+    "Göteborgsposten",
+    "Arbetet",
+    "Göteborgs Handels- och Sjöfartstidning",
+    "Haparandabladet",
+    "Norrbottens-Kuriren",
+    "Stockholms Dagblad",
+    "Svenska Dagbladet",
+    "Sydsvenska Dagbladet",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--year", type=int)
+    group.add_argument("--start-year", type=int)
+
+    parser.add_argument("--end-year", type=int)
+    parser.add_argument("--out-dir", type=str, default=str(OUT_DIR))
+    parser.add_argument("--max-gpus", type=int, default=None)
+    parser.add_argument("--fetch-threads", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-length", type=int, default=384)
+    parser.add_argument("--stride", type=int, default=64)
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--keep-partials", action="store_true")
+    parser.add_argument("--limit-packages", type=int, default=None)
+
+    args = parser.parse_args()
+
+    if args.year is not None:
+        args.years = [str(args.year)]
+    else:
+        if args.end_year is None:
+            parser.error("--end-year krävs med --start-year")
+        args.years = [str(y) for y in range(args.start_year, args.end_year + 1)]
+
+    return args
+
+
+def make_archive(password):
+    return Archive(BETALAB_URL, auth=("demo", password))
+
+
+def normalize_location(name):
+    if not name:
+        return None
+
+    s = name.strip()
+    s = re.sub(r"^[\s\.,;:!\?\)\]\}\'\"»«„“]+", "", s)
+    s = re.sub(r"[\s\.,;:!\?\(\[\{\'\"»«„“]+$", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if not s:
+        return None
+
+    def fix_token(token):
+        parts = token.split("-")
+        return "-".join(
+            p[:1].upper() + p[1:].lower() if p else p
+            for p in parts
+        )
+
+    return " ".join(fix_token(tok) for tok in s.split(" "))
+
+
 def print_cuda_diagnostics():
     print("=== CUDA Diagnostics ===")
     print("torch.__version__:", torch.__version__)
     print("torch.version.cuda:", torch.version.cuda)
     print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
     print("torch.cuda.is_available():", torch.cuda.is_available())
-    try:
-        print("torch.cuda.device_count():", torch.cuda.device_count())
-    except Exception as e:
-        print("torch.cuda.device_count() failed:", e)
-
+    print("torch.cuda.device_count():", torch.cuda.device_count())
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
-            try:
-                print(f"GPU {i}:", torch.cuda.get_device_name(i))
-            except Exception as e:
-                print(f"GPU {i} name failed:", e)
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     print("========================\n")
 
-# ================================
-# 1. Skapa NER-pipeline (en per GPU/process)
-# ================================
-from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-# ----------------------------
-    # KONFIG
-    # ----------------------------
-    root_dir = Path("/data/Words").expanduser()   # katalog som innehåller alla år
-    out_dir = "/home/jens/documents/NER"      # ABSOLUT sökväg rekommenderas
-    model_name = "dslim/bert-base-NER"
-    fp16 = True
+def create_model_and_tokenizer(worker_id, fp16, use_cpu):
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
-    max_length = 512      # bra på V100/A40
-    stride = 64
-    batch_size = 16
-    max_gpus = 8
+    if use_cpu:
+        device = "cpu"
+        torch_dtype = None
+    else:
+        device = f"cuda:{worker_id}"
+        torch_dtype = torch.float16 if fp16 else None
 
-    # ----------------------------
-    # Hitta alla år
-    # ----------------------------
-    year_dirs = sorted(
-        d for d in root_dir.iterdir()
-        if d.is_dir() and d.name.isdigit()
+    model = AutoModelForTokenClassification.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch_dtype,
     )
 
-    if not year_dirs:
-        raise RuntimeError(f"Inga årskataloger hittades i {root_dir}")
-
-    print(f"Hittade {len(year_dirs)} år:", [d.name for d in year_dirs])
-
-    available_gpus = torch.cuda.device_count()
-    if available_gpus == 0:
-        raise RuntimeError("Inga GPU:er hittades")
-
-    num_gpus = min(available_gpus, max_gpus)
-
-    # ----------------------------
-    # Kör ett år i taget
-    # ----------------------------
-    for year_path in year_dirs:
-        year = year_path.name
-        print(f"\n==============================")
-        print(f"Startar år {year}")
-        print(f"==============================")
-
-        files = sorted(str(p) for p in year_path.iterdir() if p.is_file())
-        if not files:
-            print(f"Inga filer i {year_path}, hoppar över")
-            continue
-
-        file_chunks = chunk_list(files, min(num_gpus, len(files)))
-        procs = []
-
-        for gpu_id, chunk in enumerate(file_chunks):
-            p = mp.Process(
-                target=worker_gpu,
-                args=(
-                    gpu_id,
-                    chunk,
-                    year,
-                    out_dir,
-                    model_name,
-                    fp16,
-                    batch_size,
-                    max_length,
-                    stride
-                )
-            )
-            p.start()
-            procs.append(p)
-
-        for p in procs:
-            p.join()
-
-        merge_outputs(year, out_dir)
-
-        print(f"År {year} klart ✔")
-
-def create_ner_pipeline(device: int, model_name: str = "dslim/bert-base-NER", fp16: bool = True):
-    """
-    Skapar model+tokenizer för token-classification på angiven GPU.
-    Vi kör inferens manuellt (snabbare än pipeline när du chunkar/batchar).
-    """
-    print(f"[GPU {device}] Laddar tokenizer+modell ({model_name}) ...")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    torch_dtype = torch.float16 if (fp16 and torch.cuda.is_available()) else None
-
-    model = AutoModelForTokenClassification.from_pretrained(model_name, torch_dtype=torch_dtype)
-    model.to(f"cuda:{device}")
+    model.to(device)
     model.eval()
 
-    print(f"[GPU {device}] Modell laddad. fp16={bool(torch_dtype)}")
-    return {"tokenizer": tokenizer, "model": model, "device": device, "fp16": fp16}
+    print(f"[WORKER {worker_id}] Model ready on {device}")
+    print(f"[WORKER {worker_id}] Labels:", model.config.id2label)
 
-from pathlib import Path
-import torch
+    return tokenizer, model, device
 
-class YearWalk:
-    """
-    Kör NER på en fil genom att:
-    1) tokenisera hela texten
-    2) dela upp i overlappande chunkar (overflow)
-    3) batcha inferens på GPU
-    4) extrahera LOC via offsets tillbaka till originaltexten
-    """
 
-    def __init__(self, path: str, nlp, batch_size: int = 8, max_length: int = 384, stride: int = 64):
-        self.path = path
-        self.title = Path(path).name
-        self.loclist = []
-        self.errors = 0
-
-        self.nlp = nlp
+class DirectTextNER:
+    def __init__(self, tokenizer, model, device, batch_size, max_length, stride):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = device
         self.batch_size = batch_size
         self.max_length = max_length
         self.stride = stride
 
-        # interna buffers (för att slippa scope-problem)
-        self._text = ""
-        self._input_ids_list = None
-        self._attention_mask_list = None
-        self._offset_mapping_list = None
-
-        self._run()
-
-    def _tokenize(self, tokenizer):
-        encodings = tokenizer(
-            self._text,
+    def _tokenize(self, text):
+        return self.tokenizer(
+            text,
             return_offsets_mapping=True,
             return_overflowing_tokens=True,
             truncation=True,
@@ -168,259 +145,391 @@ class YearWalk:
             stride=self.stride,
             padding=False,
         )
-        self._input_ids_list = encodings["input_ids"]
-        self._attention_mask_list = encodings["attention_mask"]
-        self._offset_mapping_list = encodings["offset_mapping"]
 
-    def _collate(self, tokenizer, device: int, batch_indices):
-        # pad per batch
-        max_len = max(len(self._input_ids_list[i]) for i in batch_indices)
+    def _collate(self, input_ids_list, attention_mask_list, offset_mapping_list, batch_indices):
+        max_len = max(len(input_ids_list[i]) for i in batch_indices)
 
         input_ids = []
         attention_mask = []
         offsets = []
 
         for i in batch_indices:
-            ids = self._input_ids_list[i]
-            am = self._attention_mask_list[i]
-            off = self._offset_mapping_list[i]
+            ids = input_ids_list[i]
+            am = attention_mask_list[i]
+            off = offset_mapping_list[i]
 
             pad_len = max_len - len(ids)
-            input_ids.append(ids + [tokenizer.pad_token_id] * pad_len)
+
+            input_ids.append(ids + [self.tokenizer.pad_token_id] * pad_len)
             attention_mask.append(am + [0] * pad_len)
             offsets.append(off + [(0, 0)] * pad_len)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.long, device=f"cuda:{device}")
-        attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=f"cuda:{device}")
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=self.device)
+
         return input_ids, attention_mask, offsets
 
-    def _extract_locs(self, pred_ids, offsets, id2label):
+    def _is_loc_label(self, label):
+        return "LOC" in label
+
+    def _extract_locs(self, text, pred_ids, offsets, id2label):
         locs = []
-        current = None  # [start, end]
+        current = None
 
         for pid, (s, e) in zip(pred_ids, offsets):
-            if s == e:  # padding/special tokens
+            if s == e:
                 continue
 
             label = id2label[int(pid)]
 
-            if label.startswith("B-") and label.endswith("LOC"):
-                if current is not None:
-                    locs.append(self._text[current[0]:current[1]])
-                current = [s, e]
-
-            elif label.startswith("I-") and label.endswith("LOC"):
+            if self._is_loc_label(label):
                 if current is None:
                     current = [s, e]
                 else:
-                    current[1] = e
-
+                    # slå ihop intilliggande/subword-tokens
+                    if s <= current[1] + 2:
+                        current[1] = e
+                    else:
+                        locs.append(text[current[0]:current[1]])
+                        current = [s, e]
             else:
                 if current is not None:
-                    locs.append(self._text[current[0]:current[1]])
+                    locs.append(text[current[0]:current[1]])
                     current = None
 
         if current is not None:
-            locs.append(self._text[current[0]:current[1]])
+            locs.append(text[current[0]:current[1]])
 
         return locs
 
-    def _run(self):
-        # --- Läs text ---
-        with open(self.path, "r", encoding="utf-8") as f:
-            self._text = f.read()
+    def extract_locations(self, text):
+        if not text or not text.strip():
+            return []
 
-        tokenizer = self.nlp["tokenizer"]
-        model = self.nlp["model"]
-        device = self.nlp["device"]
-        use_fp16 = bool(self.nlp.get("fp16", True))
+        enc = self._tokenize(text)
 
-        # --- Tokenisera ---
-        self._tokenize(tokenizer)
+        input_ids_list = enc["input_ids"]
+        attention_mask_list = enc["attention_mask"]
+        offset_mapping_list = enc["offset_mapping"]
 
-        # --- Inferens ---
-        id2label = model.config.id2label
+        id2label = self.model.config.id2label
+        all_locs = []
 
-        try:
-            with torch.no_grad():
-                n_chunks = len(self._input_ids_list)
+        with torch.no_grad():
+            n_chunks = len(input_ids_list)
 
-                for start in range(0, n_chunks, self.batch_size):
-                    batch_indices = list(range(start, min(start + self.batch_size, n_chunks)))
-                    input_ids, attention_mask, offsets_batch = self._collate(tokenizer, device, batch_indices)
+            for start in range(0, n_chunks, self.batch_size):
+                batch_indices = list(range(start, min(start + self.batch_size, n_chunks)))
 
-                    if torch.cuda.is_available() and use_fp16:
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    else:
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                input_ids, attention_mask, offsets_batch = self._collate(
+                    input_ids_list,
+                    attention_mask_list,
+                    offset_mapping_list,
+                    batch_indices,
+                )
 
-                    predictions = outputs.logits.argmax(dim=-1).detach().cpu().tolist()
+                if self.device.startswith("cuda"):
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                else:
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
 
-                    for pred_ids, offsets in zip(predictions, offsets_batch):
-                        self.loclist.extend(self._extract_locs(pred_ids, offsets, id2label))
+                predictions = outputs.logits.argmax(dim=-1).detach().cpu().tolist()
 
-        except RuntimeError as e:
-            self.errors += 1
-            print(f"[ERROR] RuntimeError i fil {self.title}: {e}")
+                for pred_ids, offsets in zip(predictions, offsets_batch):
+                    all_locs.extend(self._extract_locs(text, pred_ids, offsets, id2label))
+
+        return all_locs
 
 
-# ----------------------------
-# 3) Multi-GPU helpers
-# ----------------------------
+def get_package_ids_for_year(password, titles, year, limit_packages=None):
+    archive = make_archive(password)
+    package_ids = []
+
+    for title in titles:
+        query = f'label: "{title}" meta.created: "{year}"'
+        print(f"[YEAR {year}] Searching: {query}")
+
+        for package_id in archive.search(query):
+            package_ids.append(package_id)
+
+            if limit_packages is not None and len(package_ids) >= limit_packages:
+                print(f"[YEAR {year}] Reached limit-packages={limit_packages}")
+                return package_ids
+
+    print(f"[YEAR {year}] Total package_ids: {len(package_ids)}")
+    return package_ids
+
+
+def fetch_texts_from_package(package_id, password):
+    archive = make_archive(password)
+    texts = []
+
+    try:
+        package = archive.get(package_id)
+
+        if "content.json" not in package:
+            return texts
+
+        content_json = json.load(package.get_raw("content.json"))
+
+        if isinstance(content_json, list):
+            for item in content_json:
+                content = item.get("content")
+                if isinstance(content, str) and content.strip():
+                    texts.append(content)
+
+    except Exception as e:
+        print(f"[WARN] Failed package {package_id}: {e}")
+
+    return texts
+
+
 def chunk_list(lst, n):
-    if n <= 0:
-        return [lst]
-    if len(lst) == 0:
-        return [[] for _ in range(n)]
-    k = ceil(len(lst) / n)
-    chunks = [lst[i:i + k] for i in range(0, len(lst), k)]
-    # fyll upp med tomma listor om vi fick färre chunkar än n
-    while len(chunks) < n:
-        chunks.append([])
-    return chunks[:n]
+    n = max(1, n)
+    chunk_size = (len(lst) + n - 1) // n
+    return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
 
 
-def worker_gpu(gpu_id: int,
-               file_list,
-               year: str,
-               out_dir: str,
-               model_name: str,
-               fp16: bool,
-               batch_size: int,
-               max_length: int,
-               stride: int):
-    if not file_list:
-        print(f"[GPU {gpu_id}] Inga filer tilldelade, hoppar över.")
+def ner_worker(
+    worker_id,
+    year,
+    package_ids,
+    password,
+    out_dir,
+    batch_size,
+    max_length,
+    stride,
+    fetch_threads,
+    fp16,
+    use_cpu,
+):
+    if not package_ids:
         return
 
-    # Bind processen tydligt till en GPU
-    torch.cuda.set_device(gpu_id)
+    if not use_cpu:
+        torch.cuda.set_device(worker_id)
 
-    print(f"[GPU {gpu_id}] Startar worker: {len(file_list)} filer (år {year})")
-    nlp = create_ner_pipeline(device=gpu_id, model_name=model_name, fp16=fp16)
+    tokenizer, model, device = create_model_and_tokenizer(worker_id, fp16, use_cpu)
 
-    all_locs = []
-    total_errors = 0
+    ner = DirectTextNER(
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        batch_size=batch_size,
+        max_length=max_length,
+        stride=stride,
+    )
 
-    for fpath in file_list:
-        yw = YearWalk(
-            fpath,
-            nlp=nlp,
-            batch_size=batch_size,
-            max_length=max_length,
-            stride=stride
-        )
-        all_locs.extend(yw.loclist)
-        total_errors += yw.errors
-        print(f"[GPU {gpu_id}] Klar: {Path(fpath).name} | locs={len(yw.loclist)} | errors={yw.errors}")
+    loc_counter = Counter()
+    errors = 0
+
+    print(f"[WORKER {worker_id}] Starting year={year}, packages={len(package_ids)}")
+
+    with ThreadPoolExecutor(max_workers=fetch_threads) as ex:
+        futures = {
+            ex.submit(fetch_texts_from_package, package_id, password): package_id
+            for package_id in package_ids
+        }
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            package_id = futures[fut]
+
+            try:
+                texts = fut.result()
+            except Exception as e:
+                errors += 1
+                print(f"[WORKER {worker_id}] ERROR future {package_id}: {e}")
+                continue
+
+            for text in texts:
+                try:
+                    locs = ner.extract_locations(text)
+
+                    for loc in locs:
+                        norm = normalize_location(loc)
+                        if norm:
+                            loc_counter[norm] += 1
+
+                except Exception as e:
+                    errors += 1
+                    print(f"[WORKER {worker_id}] ERROR NER {package_id}: {e}")
+
+            if i % 10 == 0:
+                print(
+                    f"[WORKER {worker_id}] year={year} "
+                    f"{i}/{len(package_ids)} packages | "
+                    f"errors={errors} | unique_locs={len(loc_counter)}"
+                )
 
     out_dir = Path(out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{year}_gpu{gpu_id}.json"
 
-    with out_file.open("w", encoding="utf-8") as f:
+    partial_path = out_dir / f"{year}_worker{worker_id}.json"
+
+    with partial_path.open("w", encoding="utf-8") as f:
         json.dump(
-            {"year": year, "gpu": gpu_id, "locs": all_locs, "errors": total_errors},
+            {
+                "year": year,
+                "worker": worker_id,
+                "errors": errors,
+                "loc_counts": dict(loc_counter),
+            },
             f,
             ensure_ascii=False,
-            indent=2
+            indent=2,
         )
 
-    print(f"[GPU {gpu_id}] Skrev {out_file} | total locs={len(all_locs)} | total errors={total_errors}")
+    print(f"[WORKER {worker_id}] Finished: {partial_path}")
 
 
-def merge_outputs(year: str, out_dir: str, final_name: str = None):
+def merge_year_outputs(year, out_dir, keep_partials):
     out_dir = Path(out_dir).expanduser()
-    files = sorted(out_dir.glob(f"{year}_gpu*.json"))
-    if not files:
-        print(f"Inga partial-filer hittades för {year} i {out_dir}")
-        return None
+    partials = sorted(out_dir.glob(f"{year}_worker*.json"))
 
-    locs = []
-    errors = 0
-    for fp in files:
+    if not partials:
+        print(f"[MERGE] No partials found for {year}")
+        return
+
+    merged_counter = Counter()
+    total_errors = 0
+
+    for fp in partials:
         with fp.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        locs.extend(data.get("locs", []))
-        errors += int(data.get("errors", 0))
 
-    if final_name is None:
-        final_name = f"{year}.json"
-    final_path = out_dir / final_name
+        total_errors += int(data.get("errors", 0))
+        merged_counter.update(data.get("loc_counts", {}))
+
+    final_path = out_dir / f"{year}.json"
 
     with final_path.open("w", encoding="utf-8") as f:
-        json.dump({"year": year, "locs": locs, "errors": errors}, f, ensure_ascii=False, indent=2)
-
-    print(f"MERGE klar: {final_path} | locs={len(locs)} | errors={errors}")
-    return final_path
-
-
-
-# ----------------------------
-# 4) Main
-# ----------------------------
-if __name__ == "__main__":
-    # --- KONFIG ---
-    base_path = "~/Words/1907"       # katalogen för året
-    out_dir = "~/NER"        # resultatkatalog
-    model_name = "dslim/bert-base-NER"
-    fp16 = True
-
-    # Chunkning/inferens-parametrar:
-    max_length = 384   # prova 512 på A40/V100 om du har VRAM
-    stride = 64
-    batch_size = 16    # startvärde; höj på A40/V100 tills det nästan tar slut på VRAM
-
-    # Begränsa antal GPU:er om du vill
-    max_gpus = 8
-
-    # --- DIAGNOSTIK ---
-    print_cuda_diagnostics()
-
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "PyTorch hittar ingen GPU/CUDA i den här miljön.\n"
-            "Vanliga orsaker: du kör på en CPU-nod, eller har CPU-build av PyTorch, "
-            "eller fel conda/venv är aktiv."
+        json.dump(
+            {
+                "year": year,
+                "errors": total_errors,
+                "loc_counts": dict(merged_counter.most_common()),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
         )
 
-    base_path = Path(base_path).expanduser()
-    year = base_path.name
+    print(f"[MERGE] Wrote final file: {final_path}")
 
-    files = sorted([str(p) for p in base_path.iterdir() if p.is_file()])
-    if not files:
-        raise RuntimeError(f"Inga filer hittades i {base_path}")
+    if not keep_partials:
+        for fp in partials:
+            fp.unlink()
 
-    available_gpus = torch.cuda.device_count()
-    num_gpus = min(available_gpus, max_gpus)
 
-    print(f"År: {year}")
-    print(f"Filer: {len(files)}")
-    print(f"GPU:er tillgängliga: {available_gpus} | använder: {num_gpus}")
+def run_year(
+    year,
+    password,
+    out_dir,
+    max_gpus,
+    fetch_threads,
+    batch_size,
+    max_length,
+    stride,
+    fp16,
+    cpu_only,
+    keep_partials,
+    limit_packages,
+):
+    package_ids = get_package_ids_for_year(
+        password=password,
+        titles=TITLE_LIST,
+        year=year,
+        limit_packages=limit_packages,
+    )
 
-    file_chunks = chunk_list(files, num_gpus)
+    if not package_ids:
+        print(f"[YEAR {year}] No packages found.")
+        return
+
+    use_cpu = cpu_only or not torch.cuda.is_available()
+
+    if use_cpu:
+        print(f"[YEAR {year}] Running on CPU")
+        workers = 1
+        chunks = [package_ids]
+    else:
+        available_gpus = torch.cuda.device_count()
+        workers = available_gpus if max_gpus is None else min(available_gpus, max_gpus)
+        workers = min(workers, len(package_ids))
+        workers = max(1, workers)
+
+        print(f"[YEAR {year}] Running on {workers} GPU(s)")
+        chunks = chunk_list(package_ids, workers)
 
     procs = []
-    for gpu_id in range(num_gpus):
-        p = Process(
-            target=worker_gpu,
+
+    for worker_id, package_chunk in enumerate(chunks):
+        p = mp.Process(
+            target=ner_worker,
             args=(
-                gpu_id,
-                file_chunks[gpu_id],
+                worker_id,
                 year,
+                package_chunk,
+                password,
                 out_dir,
-                model_name,
-                fp16,
                 batch_size,
                 max_length,
-                stride
-            )
+                stride,
+                fetch_threads,
+                fp16,
+                use_cpu,
+            ),
         )
         p.start()
         procs.append(p)
 
+    exitcodes = []
+
     for p in procs:
         p.join()
+        exitcodes.append(p.exitcode)
 
-    merge_outputs(year, out_dir)
+    if any(code != 0 for code in exitcodes):
+        raise RuntimeError(f"[YEAR {year}] One or more workers failed. Exit codes: {exitcodes}")
+
+    merge_year_outputs(year, out_dir, keep_partials)
+
+
+def main():
+    args = parse_args()
+    mp.set_start_method("spawn", force=True)
+
+    # ÄNDRA HÄR:
+    password = "DITT_KBLAB_LÖSENORD_HÄR"
+
+    out_dir = Path(args.out_dir).expanduser()
+
+    print_cuda_diagnostics()
+    print("Years:", args.years)
+    print("Output dir:", out_dir)
+    print("Model:", MODEL_NAME)
+
+    for year in args.years:
+        print("=" * 80)
+        print(f"STARTING YEAR {year}")
+        print("=" * 80)
+
+        run_year(
+            year=year,
+            password=password,
+            out_dir=str(out_dir),
+            max_gpus=args.max_gpus,
+            fetch_threads=args.fetch_threads,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            stride=args.stride,
+            fp16=args.fp16,
+            cpu_only=args.cpu_only,
+            keep_partials=args.keep_partials,
+            limit_packages=args.limit_packages,
+        )
+
+
+if __name__ == "__main__":
+    main()
